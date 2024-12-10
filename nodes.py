@@ -7,7 +7,7 @@ import torch.nn.functional as F
 # 获取ops引用
 ops = comfy.ops.manual_cast
 
-class StyleModelAdvancedApply:
+class StyleAdvancedApply:
     @classmethod
     def INPUT_TYPES(s):
         return {
