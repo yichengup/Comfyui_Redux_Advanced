@@ -10,6 +10,7 @@ The reference picture on the left below comes from Xiaohongshu blogger - Xiaoxia
 关于我 | About me
 
 Bilibili：[我的B站主页](https://space.bilibili.com/498399023?spm_id_from=333.1007.0.0)
-wechat: DLONG189one
 QQ群：3260561522
+wechat: DLONG189one
+
 欢迎赞助投喂
