@@ -1,12 +1,11 @@
-from .nodes import *
+from .nodes import StyleAdvancedApply
 
 NODE_CLASS_MAPPINGS = {
-    "StyleModelApplyV2": StyleModelApplyV2,
+    "StyleAdvancedApply": StyleAdvancedApply,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "StyleModelApplyV2": "Redux Apply Advanced",
-
+    "StyleAdvancedApply": "Redux Style Advanced",
 }
 
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS'] 
