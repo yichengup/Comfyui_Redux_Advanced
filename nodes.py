@@ -1,506 +1,328 @@
 import torch
-import comfy.ops
-from comfy.ldm.flux.redux import ReduxImageEncoder
 import math
 import torch.nn.functional as F
+import cv2
+import numpy as np
 
-# 获取ops引用
-ops = comfy.ops.manual_cast
 
-class StyleAdvancedApply:
+class StyleModelApplyV2:
     @classmethod
     def INPUT_TYPES(s):
-        return {
-            "required": {
-                "conditioning": ("CONDITIONING",),
-                "style_model": ("STYLE_MODEL",),
-                "clip_vision_output": ("CLIP_VISION_OUTPUT",),
-                "reference_image": ("IMAGE",),
-                
-                # 处理模式选择
-                "processing_mode": (["balanced", "style_focus", "content_focus", "custom"], {
-                    "default": "balanced",
-                    "tooltip": "预设处理模式：平衡、风格优先、内容优先、自定义"
-                }),
-                
-                # 基础影响力控制
-                "prompt_influence": ("FLOAT", {
-                    "default": 1.0,
-                    "min": 0.1,
-                    "max": 2.0,
-                    "step": 0.1,
-                    "tooltip": "控制提示词的影响强度"
-                }),
-                "image_influence": ("FLOAT", {
-                    "default": 1.0,
-                    "min": 0.1,
-                    "max": 2.0,
-                    "step": 0.1,
-                    "tooltip": "控制参考图像的影响强度"
-                }),
-                
-                # 特征混合模式
-                "feature_blend_mode": (["adaptive", "add", "multiply", "maximum"], {
-                    "default": "adaptive",
-                    "tooltip": "特征混合方式：自适应、加法、乘法、最大值"
-                }),
-                
-                # 风格网格控制
-                "style_grid_size": ("INT", {
-                    "default": 9,
-                    "min": 1,
-                    "max": 14,
-                    "step": 1,
-                    "tooltip": "控制风格细节级别(1=27×27最细致, 14=1×1最粗略)"
-                }),
-            },
-            
-            "optional": {
-                # 蒙版控制组
-                "mask": ("MASK",),
-                "mask_blur": ("INT", {
-                    "default": 4,
-                    "min": 0,
-                    "max": 64,
-                    "step": 1,
-                    "tooltip": "蒙版边缘模糊半径"
-                }),
-                "mask_expansion": ("INT", {
-                    "default": 0,
-                    "min": -64,
-                    "max": 64,
-                    "step": 1,
-                    "tooltip": "蒙版扩张/收缩像素"
-                }),
-                
-                # 高级调优选项
-                "feature_weights": ("STRING", {
-                    "default": "1.2,1.0,1.1,1.3,1.0",
-                    "tooltip": "风格,颜色,内容,结构,纹理的权重(用逗号分隔)"
-                }),
-                "noise_level": ("FLOAT", {
-                    "default": 0.0,
-                    "min": 0.0,
-                    "max": 1.0,
-                    "step": 0.01,
-                    "tooltip": "添加随机噪声以增加风格变化"
-                })
-            }
-        }
-    
+        return {"required": {
+            "conditioning": ("CONDITIONING", ),
+            "style_model": ("STYLE_MODEL", ),
+            "clip_vision": ("CLIP_VISION",),
+            "image": ("IMAGE",),
+            "crop": (["center", "mask_area", "none"], {
+                "default": "none",
+                "tooltip": "裁剪模式：center-中心裁剪, mask_area-遮罩区域裁剪, none-不裁剪"
+            }),
+            "sharpen": ("FLOAT", {
+                "default": 0.0,
+                "min": -5.0,
+                "max": 5.0,
+                "step": 0.1,
+                "tooltip": "锐化强度：负值为模糊，正值为锐化，0为不处理"
+            }),
+            "patch_res": ("INT", {
+                "default": 16,
+                "min": 1,
+                "max": 64,
+                "step": 1,
+                "tooltip": "patch分辨率，数值越大分块越细致"
+            }),
+            "style_strength": ("FLOAT", {
+                "default": 1.0,
+                "min": 0.0,
+                "max": 2.0,
+                "step": 0.01,
+                "tooltip": "风格强度，越高越偏向参考图片"
+            }),
+            "prompt_strength": ("FLOAT", {  # 新增参数
+                "default": 1.0,
+                "min": 0.0,
+                "max": 2.0,
+                "step": 0.01,
+                "tooltip": "文本提示词强度，越高文本特征越强"
+            }),
+            "blend_mode": (["lerp", "feature_boost", "frequency"], {
+                "default": "lerp",
+                "tooltip": "风格强度的计算方式：\n" +
+                        "lerp - 线性混合 - 高度参考原图\n" +
+                        "feature_boost - 特征增强 - 增强真实感\n" +
+                        "frequency - 频率增强 - 增强高频细节"
+            }),
+            "noise_level": ("FLOAT", {  # 新增噪声参数
+                "default": 0.0,
+                "min": 0.0,
+                "max": 1.0,
+                "step": 0.01,
+                "tooltip": "添加随机噪声的强度，可用于修复错误细节"
+            }),
+        },
+        "optional": {  # 新增可选参数
+            "mask": ("MASK", ),  # 添加遮罩输入
+        }}
     RETURN_TYPES = ("CONDITIONING",)
-    FUNCTION = "apply_style"
+    FUNCTION = "apply_stylemodel"
     CATEGORY = "conditioning/style_model"
 
-    def __init__(self):
-        self.text_projector = ops.Linear(4096, 4096)
-        self.feature_dim = 4096
-        self.num_segments = 5  # 特征分段数量
+    def crop_to_mask_area(self, image, mask):
+        """裁剪到遮罩区域"""
+        # 处理图片维度
+        if len(image.shape) == 4:  # B H W C
+            B, H, W, C = image.shape
+            image = image.squeeze(0)  # 移除batch维度
+        else:  # H W C
+            H, W, C = image.shape
         
-    def compute_similarity(self, text_feat, image_feat):
-        """计算多维度相似度"""
-        # 余弦相似度
-        cos_sim = torch.cosine_similarity(text_feat, image_feat, dim=-1)
+        # 处理遮罩维度
+        if len(mask.shape) == 3:  # B H W
+            mask = mask.squeeze(0)  # 移除batch维度
         
-        # L2距离相似度
-        l2_dist = torch.norm(text_feat - image_feat, p=2, dim=-1)
-        l2_sim = 1 / (1 + l2_dist)
+        # 找到遮罩中非零值的坐标
+        nonzero_coords = torch.nonzero(mask)
+        if len(nonzero_coords) == 0:  # 如果遮罩全为零
+            return image, mask
         
-        # 注意力相似度
-        attention = torch.matmul(text_feat, image_feat.transpose(-2, -1))
-        attention = attention / torch.sqrt(torch.tensor(text_feat.shape[-1], dtype=torch.float32))
-        attn_sim = torch.softmax(attention, dim=-1).mean(dim=-1)
+        # 获取边界框
+        top = nonzero_coords[:, 0].min().item()
+        bottom = nonzero_coords[:, 0].max().item()
+        left = nonzero_coords[:, 1].min().item()
+        right = nonzero_coords[:, 1].max().item()
         
-        # 组合相似度
-        combined_sim = (0.4 * cos_sim + 0.3 * l2_sim + 0.3 * attn_sim)
-        return combined_sim
+        # 确保裁剪区域是正方形
+        width = right - left
+        height = bottom - top
+        size = max(width, height)
         
-    def process_features(self, image_features, text_features, mode, weights):
-        """处理和混合特征"""
-        # 维度检查和调整
-        image_features = self.check_dimensions(image_features, "image_features")
-        text_features = self.check_dimensions(text_features, "text_features")
+        # 计算中心点
+        center_y = (top + bottom) // 2
+        center_x = (left + right) // 2
         
-        # 确保batch维度匹配
-        if image_features.shape[0] != text_features.shape[0]:
-            if image_features.shape[0] == 1:
-                image_features = image_features.expand(text_features.shape[0], -1, -1)
-            elif text_features.shape[0] == 1:
-                text_features = text_features.expand(image_features.shape[0], -1, -1)
-            else:
-                raise ValueError(f"Batch size mismatch: image={image_features.shape[0]}, text={text_features.shape[0]}")
+        # 计算正方形裁剪区域
+        half_size = size // 2
+        new_top = max(0, center_y - half_size)
+        new_bottom = min(H, center_y + half_size)
+        new_left = max(0, center_x - half_size)
+        new_right = min(W, center_x + half_size)
         
-        # 分割特征
-        splits = self.feature_dim // self.num_segments
-        feature_types = ['style', 'color', 'content', 'structure', 'texture']
+        # 裁剪图片和遮罩
+        cropped_image = image[new_top:new_bottom, new_left:new_right]
+        cropped_mask = mask[new_top:new_bottom, new_left:new_right]
         
-        # 解析权重
-        try:
-            feature_weights = [float(w) for w in weights.split(",")]
-            if len(feature_weights) != self.num_segments:
-                print(f"Warning: Expected {self.num_segments} weights, got {len(feature_weights)}. Using defaults.")
-                feature_weights = [1.0] * self.num_segments
-        except:
-            feature_weights = [1.0] * self.num_segments
-            
-        # 根据模式调整权重
-        if mode == "style_focus":
-            feature_weights = [w * 1.5 if i != 2 else w * 0.5 
-                             for i, w in enumerate(feature_weights)]
-        elif mode == "content_focus":
-            feature_weights = [w * 0.5 if i != 2 else w * 1.5 
-                             for i, w in enumerate(feature_weights)]
+        # 恢复batch维度
+        cropped_image = cropped_image.unsqueeze(0)
+        cropped_mask = cropped_mask.unsqueeze(0)
         
-        # 处理每个特征段
-        processed_features = []
-        for i, feat_type in enumerate(feature_types):
-            start_idx = i * splits
-            end_idx = start_idx + splits if i < len(feature_types) - 1 else self.feature_dim
-            
-            # 获取当��特征段
-            img_feat = image_features[..., start_idx:end_idx]
-            txt_feat = text_features[..., start_idx:end_idx]
-            
-            # 计算相似度和混合
-            similarity = self.compute_similarity(txt_feat, img_feat)
-            weight = feature_weights[i]
-            
-            # 确保相似度维度正确
-            if similarity.dim() == 1:
-                similarity = similarity.unsqueeze(-1)
-            
-            # 混合特征
-            processed = txt_feat * similarity.unsqueeze(-1) * weight + \
-                       img_feat * (1 - similarity.unsqueeze(-1)) * weight
-            
-            processed_features.append(processed)
+        return cropped_image, cropped_mask
+    
+    def apply_image_preprocess(self, image, strength):
+        """统一的图像预处理函数"""
+        # 保存原始维度信息
+        original_shape = image.shape
+        original_device = image.device
         
-        # 合并所有特征
-        final_features = torch.cat(processed_features, dim=-1)
+        # 转换为numpy数组
+        if torch.is_tensor(image):
+            if len(image.shape) == 4:  # B H W C
+                image_np = (image[0].cpu().numpy() * 255).astype(np.uint8)
+            else:  # H W C
+                image_np = (image.cpu().numpy() * 255).astype(np.uint8)
         
-        # 最终维度检查
-        final_features = self.check_dimensions(final_features, "final_features")
+        if strength < 0:  # 模糊处理
+            abs_strength = abs(strength)
+            kernel_size = int(3 + abs_strength * 12) // 2 * 2 + 1  # 最大到15
+            sigma = 0.3 + abs_strength * 2.7  # 最大到3
+            processed = cv2.GaussianBlur(image_np, (kernel_size, kernel_size), sigma)
+        elif strength > 0:  # 锐化处理
+            kernel = np.array([[-1,-1,-1],
+                             [-1, 9,-1],
+                             [-1,-1,-1]]) * strength + np.array([[0,0,0],
+                                                               [0,1,0],
+                                                               [0,0,0]]) * (1 - strength)
+            processed = cv2.filter2D(image_np, -1, kernel)
+            processed = np.clip(processed, 0, 255)
+        else:  # 不处理
+            processed = image_np
         
-        return final_features
+        # 转回tensor并恢复原始维度
+        processed_tensor = torch.from_numpy(processed.astype(np.float32) / 255.0).to(original_device)
+        if len(original_shape) == 4:
+            processed_tensor = processed_tensor.unsqueeze(0)
         
-    def blend_features(self, img_feat, text_feat, mode="adaptive", weight=1.0):
-        """特征混合"""
-        if mode == "adaptive":
-            similarity = self.compute_similarity(text_feat, img_feat)
-            blend_weight = torch.sigmoid(similarity * weight)
-            return img_feat * (1 - blend_weight.unsqueeze(-1)) + \
-                   text_feat * blend_weight.unsqueeze(-1)
-        elif mode == "add":
-            return img_feat + text_feat * weight
-        elif mode == "multiply":
-            return img_feat * (1 + text_feat * weight)
-        elif mode == "maximum":
-            return torch.maximum(img_feat, text_feat * weight)
-        return img_feat
+        return processed_tensor
+
+    def apply_style_strength(self, cond, txt, strength, mode="lerp"):
+        """使用不同模式应用风格强度"""
+        if mode == "lerp":
+            # 线性插值模式保持不变
+            if txt.shape[1] != cond.shape[1]:
+                txt_mean = txt.mean(dim=1, keepdim=True)
+                txt_expanded = txt_mean.expand(-1, cond.shape[1], -1)
+                return torch.lerp(txt_expanded, cond, strength)
+            return torch.lerp(txt, cond, strength)
         
-    def prepare_image(self, image, mask=None, mode="center_crop", padding=32):
-        """预处理参考图像"""
-        B, H, W, C = image.shape
-        
-        if mode == "center_crop":
-            # 计算裁剪位置（居中裁剪）
-            crop_size = min(H, W)
-            x = max(0, (W - crop_size) // 2)
-            y = max(0, (H - crop_size) // 2)
-            
-            # 执行裁剪
-            end_x = x + crop_size
-            end_y = y + crop_size
-            image = image[:, y:end_y, x:end_x, :]
-            
-            # 调整大小
-            image = torch.nn.functional.interpolate(
-                image.transpose(-1, 1),
-                size=(self.desired_size, self.desired_size),
-                mode="bicubic",
-                antialias=True,
-                align_corners=True
-            ).transpose(1, -1)
-            
-        elif mode == "keep_aspect":
-            # 保持宽高比调整大小
-            ratio = self.desired_size / max(H, W)
-            new_h = int(H * ratio)
-            new_w = int(W * ratio)
-            
-            image = torch.nn.functional.interpolate(
-                image.transpose(-1, 1),
-                size=(new_h, new_w),
-                mode="bicubic",
-                antialias=True,
-                align_corners=True
-            ).transpose(1, -1)
-            
-        elif mode in ["mask_crop", "mask_region"] and mask is not None:
-            # 处理蒙版相关的裁剪
-            mask_binary = (mask > 0.5).float()
-            y_indices, x_indices = torch.where(mask_binary > 0)
-            
-            if len(y_indices) > 0 and len(x_indices) > 0:
-                # 计算边界框
-                top = max(0, y_indices.min().item() - padding)
-                bottom = min(H, y_indices.max().item() + padding)
-                left = max(0, x_indices.min().item() - padding)
-                right = min(W, x_indices.max().item() + padding)
+        elif mode == "feature_boost":
+            # feature_boost 模式保持不变
+            mean = torch.mean(cond, dim=-1, keepdim=True)
+            std = torch.std(cond, dim=-1, keepdim=True)
+            normalized = (cond - mean) / (std + 1e-6)
+            boost = torch.tanh(normalized * (strength * 2.0))
+            return cond * (1 + boost * 2.0)
+    
+        elif mode == "frequency":
+            try:
+                # 获取形状
+                B, N, C = cond.shape
                 
-                # 裁剪图像
-                image = image[:, top:bottom, left:right, :]
+                # 1. 准备数据
+                x = cond.float()  # 确保使用浮点数
                 
-                # 调整大小
-                image = torch.nn.functional.interpolate(
-                    image.transpose(-1, 1),
-                    size=(self.desired_size, self.desired_size),
-                    mode="bicubic",
-                    antialias=True,
-                    align_corners=True
-                ).transpose(1, -1)
+                # 2. 在特征维度上进行FFT
+                fft = torch.fft.rfft(x, dim=-1)
+                
+                # 3. 分离幅度和相位
+                magnitudes = torch.abs(fft)
+                phases = torch.angle(fft)
+                
+                # 4. 创建频率增强滤波器
+                freq_dim = fft.shape[-1]
+                
+                # 创建一个更复杂的频率响应曲线
+                freq_range = torch.linspace(0, 1, freq_dim, device=cond.device)
+                
+                # 设计高频增强滤波器
+                alpha = 2.0 * strength  # 控制增强强度
+                beta = 0.5  # 控制频率响应的形状
+                
+                # 构建频率响应
+                filter_response = 1.0 + alpha * torch.pow(freq_range, beta)
+                filter_response = filter_response.view(1, 1, -1)
+                
+                # 5. 应用滤波器
+                enhanced_magnitudes = magnitudes * filter_response
+                
+                # 6. 重建信号
+                enhanced_fft = enhanced_magnitudes * torch.exp(1j * phases)
+                enhanced = torch.fft.irfft(enhanced_fft, n=C, dim=-1)
+                
+                # 7. 归一化处理
+                mean = enhanced.mean(dim=-1, keepdim=True)
+                std = enhanced.std(dim=-1, keepdim=True)
+                enhanced_norm = (enhanced - mean) / (std + 1e-6)
+                
+                # 8. 混合原始信号和增强信号
+                mix_ratio = torch.sigmoid(torch.tensor(strength * 2 - 1))
+                result = torch.lerp(cond, enhanced_norm.to(cond.dtype), mix_ratio)
+                
+                # 9. 添加残差连接
+                residual = (result - cond) * strength
+                final = cond + residual
+                
+                return final
+                
+            except Exception as e:
+                print(f"频率处理出错: {e}")
+                print(f"输入张量形状: {cond.shape}")
+                return cond
+                
+        return cond
+
+    def apply_stylemodel(self, conditioning, style_model, clip_vision, image, 
+                        patch_res=16, style_strength=1.0, prompt_strength=1.0, 
+                        noise_level=0.0, crop="none", sharpen=0.0,
+                        blend_mode="lerp", mask=None):
         
-        return image
+        # 预处理输入图像
+        processed_image = image.clone()
+        if sharpen != 0:
+            processed_image = self.apply_image_preprocess(processed_image, sharpen)
+        # 处理裁剪
+        if crop == "mask_area" and mask is not None:
+            processed_image, mask = self.crop_to_mask_area(processed_image, mask)
+            clip_vision_output = clip_vision.encode_image(processed_image, crop=False)
+        else:
+            # 对于center和none模式，直接使用CLIP的crop参数
+            crop_image = True if crop == "center" else False
+            clip_vision_output = clip_vision.encode_image(processed_image, crop=crop_image)
         
-    def gaussian_blur(self, tensor, kernel_size):
-        """实现高斯模糊
-        Args:
-            tensor: 输入张量 [B, C, H, W]
-            kernel_size: 模糊核大小
-        """
-        if kernel_size <= 0:
-            return tensor
-            
-        # 确保kernel_size是奇数
-        kernel_size = kernel_size * 2 + 1 if kernel_size > 0 else 1
+        # 获取原始条件向量
+        cond = style_model.get_cond(clip_vision_output)
         
-        # 创建高斯核
-        sigma = kernel_size / 6.0  # 标准差
-        channels = tensor.shape[1] if len(tensor.shape) == 4 else 1
+        # 重塑为空间结构 [batch, height, width, channels]
+        B = cond.shape[0]
+        H = W = int(math.sqrt(cond.shape[1]))  # 假设是方形
+        C = cond.shape[2]
+        cond = cond.reshape(B, H, W, C)
         
-        # 生成一维高斯核
-        x = torch.arange(-(kernel_size // 2), kernel_size // 2 + 1, dtype=torch.float32, device=tensor.device)
-        gaussian_1d = torch.exp(-x.pow(2) / (2 * sigma ** 2))
-        gaussian_1d = gaussian_1d / gaussian_1d.sum()
+        # 根据patch_res进行重新划分
+        new_H = H * patch_res // 16  # 16是CLIP默认的patch size
+        new_W = W * patch_res // 16
         
-        # 扩展为二维核
-        kernel = gaussian_1d.view(1, 1, -1, 1) * gaussian_1d.view(1, 1, 1, -1)
-        kernel = kernel.expand(channels, 1, kernel_size, kernel_size)
-        
-        # 应用padding
-        padding = kernel_size // 2
-        
-        # 确保输入tensor是4D
-        input_dim = len(tensor.shape)
-        if input_dim == 3:
-            tensor = tensor.unsqueeze(1)
-        
-        # 应用模糊
-        blurred = F.conv2d(
-            tensor,
-            kernel,
-            padding=padding,
-            groups=channels
+        # 使用插值调整特征图大小
+        cond = torch.nn.functional.interpolate(
+            cond.permute(0, 3, 1, 2),  # [B, C, H, W]
+            size=(new_H, new_W),
+            mode='bilinear',
+            align_corners=False
         )
         
-        # 恢复原始维度
-        if input_dim == 3:
-            blurred = blurred.squeeze(1)
-            
-        return blurred
-
-    def process_mask_in_pixel_space(self, mask, blur_radius, expansion, reference_image):
-        """在像素空间处理蒙版，使用参考图像进行空间定位
-        Args:
-            mask: 输入蒙版
-            blur_radius: 模糊半径
-            expansion: 扩张/收缩像素
-            reference_image: 参考图像，用于空间定位
-        """
-        if mask is None:
-            return None
-            
-        # 获取参考图像的尺寸
-        image_size = reference_image.shape[1:3]  # [B, H, W, C] -> [H, W]
-            
-        # 确保蒙版是正确的尺寸
-        if mask.shape[-2:] != image_size:
-            mask = torch.nn.functional.interpolate(
-                mask.unsqueeze(1) if mask.dim() == 3 else mask,
-                size=image_size,
-                mode='bilinear',
-                align_corners=False
-            )
+        # 重新展平
+        cond = cond.permute(0, 2, 3, 1)  # [B, H, W, C]
+        cond = cond.reshape(B, -1, C)  # [B, H*W, C]
+        cond = cond.flatten(start_dim=0, end_dim=1).unsqueeze(dim=0)
         
-        # 扩张/收缩处理
-        if expansion != 0:
-            kernel_size = abs(expansion) * 2 + 1
-            padding = kernel_size // 2
-            kernel = torch.ones(1, 1, kernel_size, kernel_size).to(mask.device)
+        c_out = []
+        for t in conditioning:
+            txt, keys = t
+            keys = keys.copy()
             
-            if expansion > 0:  # 扩张
-                mask = torch.nn.functional.max_pool2d(mask, kernel_size, stride=1, padding=padding)
-            else:  # 收缩
-                mask = 1 - torch.nn.functional.max_pool2d(1 - mask, kernel_size, stride=1, padding=padding)
-        
-        # 高斯模糊
-        if blur_radius > 0:
-            mask = self.gaussian_blur(mask, blur_radius)
+            # 增强文本特征 - 使用更强的缩放方式
+            if prompt_strength != 1.0:
+                # 使用非线性缩放来增强文本特征
+                txt_enhanced = txt * (prompt_strength ** 3)
+                # 添加额外的文本特征副本来增强其影响力
+                txt_repeated = txt_enhanced.repeat(1, 2, 1)  # 重复文本特征
+                txt = txt_repeated
             
-        # 归一化到[0,1]范围
-        mask = torch.clamp(mask, 0, 1)
-        
-        return mask
-
-    def apply_style(self, conditioning, style_model, clip_vision_output, reference_image,
-                   processing_mode="balanced",
-                   prompt_influence=1.0, image_influence=1.0,
-                   style_grid_size=9, feature_blend_mode="adaptive",
-                   mask=None, mask_blur=4, mask_expansion=0,
-                   noise_level=0.0, feature_weights="1.2,1.0,1.1,1.3,1.0"):
-        """应用风格的主要方法"""
-        try:
-            # 获取并检查图像特征（从CLIP Vision获取）
-            image_features = style_model.get_cond(clip_vision_output)
-            image_features = self.check_dimensions(
-                image_features.flatten(start_dim=0, end_dim=1),
-                "image_features"
-            )
-            
-            # 获取并检查文本特征
-            text_features = conditioning[0][0]
-            text_features = self.check_dimensions(
-                text_features.mean(dim=1),
-                "text_features"
-            )
-            
-            # 处理特征
-            final_features = self.process_features(
-                image_features,
-                text_features,
-                processing_mode,
-                feature_weights
-            )
-            
-            # 应用全局影响力
-            final_features = (
-                final_features * image_influence + 
-                text_features * prompt_influence
-            ) / (image_influence + prompt_influence)
-            
-            # 在像素空间处理蒙版，使用参考图像进行空间定位
-            if mask is not None:
-                processed_mask = self.process_mask_in_pixel_space(
-                    mask,
-                    mask_blur,
-                    mask_expansion,
-                    reference_image
+            # 处理风格特征
+            if style_strength != 1.0:
+                processed_cond = self.apply_style_strength(
+                    cond, txt, style_strength, blend_mode
                 )
+            else:
+                processed_cond = cond
+
+            # 处理遮罩
+            if mask is not None:
+                feature_size = int(math.sqrt(processed_cond.shape[1]))
+                processed_mask = torch.nn.functional.interpolate(
+                    mask.unsqueeze(1) if mask.dim() == 3 else mask,
+                    size=(feature_size, feature_size),
+                    mode='bilinear',
+                    align_corners=False
+                ).flatten(1).unsqueeze(-1)
                 
-                # 将处理后的蒙版应用到特征上
-                if processed_mask is not None:
-                    # 计算特征的空间尺寸
-                    feature_size = int(math.sqrt(final_features.shape[1]))
-                    
-                    # 调整蒙版尺寸以匹配特征空间
-                    processed_mask = torch.nn.functional.interpolate(
-                        processed_mask.unsqueeze(1) if processed_mask.dim() == 3 else processed_mask,
-                        size=(feature_size, feature_size),
-                        mode='bilinear',
-                        align_corners=False
-                    )
-                    
-                    # 调整蒙版维度以匹配特征
-                    processed_mask = processed_mask.flatten(1)
-                    processed_mask = processed_mask.unsqueeze(-1)
-                    
-                    # 确保维度匹配
-                    if processed_mask.shape[1] != final_features.shape[1]:
-                        print(f"Warning: Mask shape {processed_mask.shape} does not match feature shape {final_features.shape}")
-                        processed_mask = torch.nn.functional.interpolate(
-                            processed_mask.view(processed_mask.shape[0], 1, feature_size, feature_size),
-                            size=(int(math.sqrt(final_features.shape[1])), int(math.sqrt(final_features.shape[1]))),
-                            mode='bilinear',
-                            align_corners=False
-                        ).flatten(1).unsqueeze(-1)
-                    
-                    # 应用蒙版
-                    final_features = final_features * processed_mask + \
-                                   text_features * (1 - processed_mask)
-            
+                # 确保文本特征维度匹配
+                if txt.shape[1] != processed_cond.shape[1]:
+                    txt_mean = txt.mean(dim=1, keepdim=True)
+                    txt_expanded = txt_mean.expand(-1, processed_cond.shape[1], -1)
+                else:
+                    txt_expanded = txt
+                
+                # 在遮罩区域使用处理后的特征，非遮罩区域使用原始文本特征
+                processed_cond = processed_cond * processed_mask + \
+                               txt_expanded * (1 - processed_mask)
+
             # 添加噪声
             if noise_level > 0:
-                noise = torch.randn_like(final_features) * noise_level
-                final_features = final_features + noise
-            
-            # 构建新的条件
-            c = []
-            for t in conditioning:
-                # 确保维度匹配
-                orig_shape = t[0].shape
-                adjusted_features = final_features
+                noise = torch.randn_like(processed_cond) * noise_level
+                processed_cond = processed_cond + noise
                 
-                # 调整batch维度
-                if adjusted_features.shape[0] != orig_shape[0]:
-                    adjusted_features = adjusted_features.expand(orig_shape[0], -1, -1)
-                
-                # 连接特征
-                try:
-                    n = [torch.cat((t[0], adjusted_features), dim=1), t[1].copy()]
-                    c.append(n)
-                except RuntimeError as e:
-                    print(f"维度信息 - 原始条件: {t[0].shape}, 调整后特征: {adjusted_features.shape}")
-                    raise RuntimeError(f"特征连接失败: {str(e)}") from e
-            
-            return (c,)
-            
-        except Exception as e:
-            print(f"Error in apply_style: {str(e)}")
-            print(f"维度信息:")
-            if 'text_features' in locals(): print(f"- text_features: {text_features.shape}")
-            if 'image_features' in locals(): print(f"- image_features: {image_features.shape}")
-            if 'final_features' in locals(): print(f"- final_features: {final_features.shape}")
-            raise
+            c_out.append([torch.cat((txt, processed_cond), dim=1), keys])
         
-    def check_dimensions(self, features, name="features"):
-        """检查并修正特征维度"""
-        if features is None:
-            raise ValueError(f"{name} cannot be None")
-            
-        # 确保是tensor
-        if not isinstance(features, torch.Tensor):
-            features = torch.tensor(features)
-            
-        # 添加缺失的维度
-        if features.dim() == 2:
-            features = features.unsqueeze(0)  # [N, D] -> [1, N, D]
-        elif features.dim() == 1:
-            features = features.unsqueeze(0).unsqueeze(0)  # [D] -> [1, 1, D]
-        elif features.dim() == 4:  # [B, H, W, C]
-            features = features.flatten(1, 2)  # -> [B, H*W, C]
-            
-        # 检查最后一个维度
-        if features.shape[-1] != self.feature_dim:
-            print(f"Warning: {name} dimension mismatch. Expected {self.feature_dim}, got {features.shape[-1]}. Adjusting...")
-            features = self.resize_feature_dim(features)
-            
-        return features
-        
-    def resize_feature_dim(self, features):
-        """调整特征维度到目标维度"""
-        orig_shape = features.shape
-        # 展到2D进行处理
-        flat_features = features.reshape(-1, features.shape[-1])
-        
-        # 使用线性插值调整维度
-        resized = torch.nn.functional.interpolate(
-            flat_features.unsqueeze(0).unsqueeze(-2),
-            size=(1, self.feature_dim),
-            mode='linear',
-            align_corners=False
-        ).squeeze(0).squeeze(-2)
-        
-        # 恢复原始维度数
-        new_shape = list(orig_shape[:-1]) + [self.feature_dim]
-        return resized.reshape(new_shape)
+        return (c_out,)
+    
+    
 
