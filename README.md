@@ -17,9 +17,9 @@
 
 - "noise_level" "添加随机噪声的强度，可用于修复错误细节"
 
-![image](./show1.png)
+![image](./show_1.png)
 
-![image](./show2.png)
+![image](./show_2.png)
 
 # 旧版
 
