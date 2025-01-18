@@ -1,11 +1,11 @@
 from .nodes import *
 
 NODE_CLASS_MAPPINGS = {
-    "StyleModelApplyV2": StyleModelApplyV2,
+    "YC_LG_Redux": YC_LG_Redux,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "StyleModelApplyV2": "Redux Apply Advanced",
+    "YC_LG_Redux": "YC_LG_Redux_Advance",
 
 }
 
