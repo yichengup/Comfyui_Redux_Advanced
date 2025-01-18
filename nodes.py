@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 
 
-class StyleModelApplyV2:
+class YC_LG_Redux:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
