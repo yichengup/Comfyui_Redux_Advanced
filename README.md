@@ -9,11 +9,9 @@
 - "prompt_strength" "文本提示词强度，越高文本特征越强"
 - "blend_mode" "风格强度的计算方式：
 
-  "lerp - 线性混合 - 高度参考原图"
-
-  "feature_boost - 特征增强 - 增强真实感"
-
-  "frequency - 频率增强 - 增强高频细节"
+      "lerp - 线性混合 - 高度参考原图"
+      "feature_boost - 特征增强 - 增强真实感"
+      "frequency - 频率增强 - 增强高频细节"
 
 - "noise_level" "添加随机噪声的强度，可用于修复错误细节"
 
