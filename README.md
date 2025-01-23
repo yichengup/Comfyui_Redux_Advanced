@@ -19,6 +19,9 @@
 
 ![image](./show_2.png)
 
+工作流图片（将工作流图片拖拽入comfyui界面即可）
+
+![image](./example/YC_LG_REDUX.png)
 # 旧版
 
 ![image](https://github.com/user-attachments/assets/02b45893-cc2f-4dd1-aae9-a83d28b1a395)
