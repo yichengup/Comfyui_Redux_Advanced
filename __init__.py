@@ -1,4 +1,4 @@
-from .nodes import *
+from .nodes import YC_LG_Redux
 from .nodes2 import StyleAdvancedApply
 
 NODE_CLASS_MAPPINGS = {
