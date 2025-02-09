@@ -193,12 +193,16 @@ class YC_LG_Redux:
         processed_image = image.clone()
         if sharpen != 0:
             processed_image = self.apply_image_preprocess(processed_image, sharpen)
-        if crop == "mask_area" and mask is not None:
-            processed_image, mask = self.crop_to_mask_area(processed_image, mask)
-            clip_vision_output = clip_vision.encode_image(processed_image, crop=False)
-        else:
-            crop_image = True if crop == "center" else False
-            clip_vision_output = clip_vision.encode_image(processed_image, crop=crop_image)
+        try:
+            if crop == "mask_area" and mask is not None:
+                processed_image, mask = self.crop_to_mask_area(processed_image, mask)
+                clip_vision_output = clip_vision.encode_image(processed_image)
+            else:
+                crop_mode = "center" if crop == "center" else "none"
+                clip_vision_output = clip_vision.encode_image(processed_image, crop=crop_mode)[0]
+        except Exception as e:
+            print(f"CLIP视觉编码出错: {e}")
+            clip_vision_output = clip_vision.encode_image(processed_image)
         
         cond = style_model.get_cond(clip_vision_output)
         
