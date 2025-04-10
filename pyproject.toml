@@ -1,7 +1,7 @@
 [project]
 name = "redux_advanced"
 description = "Redux style adds more controls"
-version = "1.0.0"
+version = "1.0.1"
 license = {file = "LICENSE"}
 
 [project.urls]
