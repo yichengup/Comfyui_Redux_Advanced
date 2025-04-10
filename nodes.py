@@ -198,8 +198,8 @@ class YC_LG_Redux:
                 processed_image, mask = self.crop_to_mask_area(processed_image, mask)
                 clip_vision_output = clip_vision.encode_image(processed_image)
             else:
-                crop_mode = "center" if crop == "center" else "none"
-                clip_vision_output = clip_vision.encode_image(processed_image, crop=crop_mode)
+                crop_bool = crop == "center"
+                clip_vision_output = clip_vision.encode_image(processed_image, crop=crop_bool)
         except Exception as e:
             print(f"CLIP视觉编码出错: {e}")
             clip_vision_output = clip_vision.encode_image(processed_image)
